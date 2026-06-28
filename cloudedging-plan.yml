@@ -1,0 +1,111 @@
+# CloudEdging — Terraform plan-on-PR (plan only; nothing is applied)
+#
+# ONE-TIME SETUP (you add this file; CloudEdging's GitHub App does NOT write it):
+#   1. Commit this file to your repo at: .github/workflows/cloudedging-plan.yml
+#   2. Add a repository secret named HCLOUD_TOKEN (Settings > Secrets and
+#      variables > Actions) = your Hetzner Cloud API token.
+#   3. (Only if your migration drafts don't bake an SSH key name) optionally add
+#      a repo secret HCLOUD_SSH_KEY_NAME = the name of an existing SSH key in your
+#      Hetzner project.
+#
+# What it does: when CloudEdging opens a migration PR (touching
+# cloudedging/migrations/**), this runs `terraform plan` IN YOUR repo's Actions,
+# using YOUR token, and posts the plan as a PR comment so you approve a real diff
+# before merging. CloudEdging never sees your token and never applies anything.
+name: CloudEdging migration plan
+
+on:
+  pull_request:
+    paths:
+      - 'cloudedging/migrations/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform plan for changed migration(s)
+        env:
+          # Hetzner token routed to the Terraform variable (the generated main.tf
+          # uses `token = var.hcloud_token`, not the provider's native env var).
+          # `sensitive = true` keeps it out of plan output. Empty -> provider errors.
+          TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+          SSH_KEY_NAME: ${{ secrets.HCLOUD_SSH_KEY_NAME }}
+        run: |
+          set -uo pipefail
+          base='${{ github.event.pull_request.base.sha }}'
+          head='${{ github.event.pull_request.head.sha }}'
+
+          dirs=$(git diff --name-only "$base" "$head" -- 'cloudedging/migrations/**' \
+            | sed -n 's|\(cloudedging/migrations/[^/]*\)/.*|\1|p' | sort -u)
+
+          {
+            echo '<!-- cloudedging-plan -->'
+            echo '### CloudEdging — `terraform plan` (DRAFT — nothing is applied)'
+            echo
+          } > plan_comment.md
+
+          if [ -z "$dirs" ]; then
+            echo '_No `cloudedging/migrations/**` changes detected in this PR._' >> plan_comment.md
+            exit 0
+          fi
+
+          # Only pass ssh_key_name if a secret is set, so we never clobber a value
+          # the draft may already bake as a default.
+          var_args=()
+          if [ -n "${SSH_KEY_NAME:-}" ]; then var_args+=(-var "ssh_key_name=${SSH_KEY_NAME}"); fi
+
+          status=0
+          for d in $dirs; do
+            echo "#### \`$d\`" >> plan_comment.md
+            echo '```terraform' >> plan_comment.md
+            (
+              cd "$d" || exit 1
+              terraform init -input=false -no-color
+              terraform plan -input=false -no-color "${var_args[@]}"
+            ) > plan_out.txt 2>&1 || status=1
+            # Cap each plan to keep the comment under GitHub's 65k limit.
+            tail -c 55000 plan_out.txt >> plan_comment.md
+            rm -f plan_out.txt
+            echo '```' >> plan_comment.md
+            echo >> plan_comment.md
+          done
+
+          if [ "$status" -ne 0 ]; then
+            {
+              echo '> ⚠️ A plan step failed. Most common cause: the **`HCLOUD_TOKEN`**'
+              echo '> repository secret is not set, or `ssh_key_name` has no value and no'
+              echo '> baked default. See CloudEdging’s plan-workflow setup notes.'
+            } >> plan_comment.md
+          fi
+
+      - name: Post plan as PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- cloudedging-plan -->';
+            let body;
+            try { body = fs.readFileSync('plan_comment.md', 'utf8'); }
+            catch (e) { body = marker + '\n_CloudEdging plan produced no output._'; }
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
